@@ -122,7 +122,7 @@ struct dio {
 
 	/* BIO completion state */
 	spinlock_t bio_lock;		/* protects BIO fields below */
-	unsigned long refcount;		/* direct_io_worker() and bios */
+	unsigned long refcount;
 	struct bio *bio_list;		/* singly linked via bi_private */
 	struct task_struct *waiter;	/* waiting task (NULL if none) */
 
@@ -993,63 +993,6 @@ static int dio_lock_and_flush(struct dio *dio, loff_t offset, loff_t end)
 	return 0;
 }
 
-/*
- * Releases both i_mutex and i_alloc_sem
- */
-static ssize_t
-direct_io_worker(int rw, struct kiocb *iocb, struct inode *inode, 
-	const struct iovec *iov, loff_t offset, unsigned long nr_segs, 
-	unsigned blkbits, get_block_t get_block, dio_iodone_t end_io,
-	struct dio *dio)
-{
-	unsigned long user_addr; 
-	int seg;
-	ssize_t ret = 0;
-	size_t bytes;
-
-	for (seg = 0; seg < nr_segs; seg++) {
-		user_addr = (unsigned long)iov[seg].iov_base;
-		dio->pages_in_io +=
-			((user_addr+iov[seg].iov_len +PAGE_SIZE-1)/PAGE_SIZE
-				- user_addr/PAGE_SIZE);
-	}
-
-	for (seg = 0; seg < nr_segs; seg++) {
-		user_addr = (unsigned long)iov[seg].iov_base;
-		dio->size += bytes = iov[seg].iov_len;
-
-		/* Index into the first page of the first block */
-		dio->first_block_in_page = (user_addr & ~PAGE_MASK) >> blkbits;
-		dio->final_block_in_request = dio->block_in_file +
-						(bytes >> blkbits);
-		/* Page fetching state */
-		dio->head = 0;
-		dio->tail = 0;
-		dio->curr_page = 0;
-
-		dio->total_pages = 0;
-		if (user_addr & (PAGE_SIZE-1)) {
-			dio->total_pages++;
-			bytes -= PAGE_SIZE - (user_addr & (PAGE_SIZE - 1));
-		}
-		dio->total_pages += (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-		dio->curr_user_address = user_addr;
-	
-		ret = do_direct_IO(dio);
-
-		dio->result += iov[seg].iov_len -
-			((dio->final_block_in_request - dio->block_in_file) <<
-					blkbits);
-
-		if (ret) {
-			dio_cleanup(dio);
-			break;
-		}
-	} /* end iovec loop */
-
-	return ret;
-}
-
 static ssize_t dio_post_submission(int rw, struct kiocb *iocb,
 				   struct inode *inode, loff_t offset,
 				   unsigned blkbits, get_block_t get_block,
@@ -1233,8 +1176,8 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	int dio_lock_type)
 {
 	int seg;
-	size_t size;
-	unsigned long addr;
+	size_t bytes;
+	unsigned long user_addr;
 	unsigned blkbits = inode->i_blkbits;
 	ssize_t retval = -EINVAL;
 	loff_t end = offset;
@@ -1250,10 +1193,10 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 
 	/* Check the memory alignment.  Blocks cannot straddle pages */
 	for (seg = 0; seg < nr_segs; seg++) {
-		addr = (unsigned long)iov[seg].iov_base;
-		size = iov[seg].iov_len;
-		end += size;
-		if (!dio_aligned(addr|size, &blkbits, bdev)) {
+		user_addr = (unsigned long)iov[seg].iov_base;
+		bytes = iov[seg].iov_len;
+		end += bytes;
+		if (!dio_aligned(user_addr|bytes, &blkbits, bdev)) {
 			retval = -EINVAL;
 			goto out;
 		}
@@ -1271,8 +1214,46 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 		goto out;
 	}
 
-	retval = direct_io_worker(rw, iocb, inode, iov, offset,
-				nr_segs, blkbits, get_block, end_io, dio);
+	for (seg = 0; seg < nr_segs; seg++) {
+		user_addr = (unsigned long)iov[seg].iov_base;
+		dio->pages_in_io +=
+			((user_addr+iov[seg].iov_len +PAGE_SIZE-1)/PAGE_SIZE
+				- user_addr/PAGE_SIZE);
+	}
+
+	for (seg = 0; seg < nr_segs; seg++) {
+		user_addr = (unsigned long)iov[seg].iov_base;
+		dio->size += bytes = iov[seg].iov_len;
+
+		/* Index into the first page of the first block */
+		dio->first_block_in_page = (user_addr & ~PAGE_MASK) >> blkbits;
+		dio->final_block_in_request = dio->block_in_file +
+						(bytes >> blkbits);
+		/* Page fetching state */
+		dio->head = 0;
+		dio->tail = 0;
+		dio->curr_page = 0;
+
+		dio->total_pages = 0;
+		if (user_addr & (PAGE_SIZE-1)) {
+			dio->total_pages++;
+			bytes -= PAGE_SIZE - (user_addr & (PAGE_SIZE - 1));
+		}
+		dio->total_pages += (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+		dio->curr_user_address = user_addr;
+
+		retval = do_direct_IO(dio);
+
+		dio->result += iov[seg].iov_len -
+			((dio->final_block_in_request - dio->block_in_file) <<
+					blkbits);
+
+		if (retval) {
+			dio_cleanup(dio);
+			break;
+		}
+	} /* end iovec loop */
+
 	retval = dio_post_submission(rw, iocb, inode, offset, blkbits,
 				     get_block, end_io, dio, end, retval);
 out:
