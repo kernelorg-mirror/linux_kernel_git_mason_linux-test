@@ -953,6 +953,46 @@ static int dio_aligned(unsigned long offset, unsigned *blkbits,
 	return 1;
 }
 
+static int dio_lock_and_flush(struct dio *dio, loff_t offset, loff_t end)
+{
+	struct inode *inode = dio->inode;
+	int ret;
+
+	/*
+	 * For block device access DIO_NO_LOCKING is used,
+	 *	neither readers nor writers do any locking at all
+	 * For regular files using DIO_LOCKING,
+	 *	readers need to grab i_mutex and i_alloc_sem
+	 *	writers need to grab i_alloc_sem only (i_mutex is already held)
+	 * For regular files using DIO_OWN_LOCKING,
+	 *	neither readers nor writers take any locks here
+	 */
+	if (dio->lock_type != DIO_NO_LOCKING) {
+		/* watch out for a 0 len io from a tricksy fs */
+		if (dio->rw == READ && end > offset) {
+			if (dio->lock_type != DIO_OWN_LOCKING)
+				mutex_lock(&inode->i_mutex);
+
+			ret = filemap_write_and_wait_range(inode->i_mapping,
+							   offset, end - 1);
+			if (ret) {
+				if (dio->lock_type != DIO_OWN_LOCKING)
+					mutex_unlock(&inode->i_mutex);
+				return ret;
+			}
+
+			if (dio->lock_type == DIO_OWN_LOCKING)
+				mutex_unlock(&inode->i_mutex);
+		}
+
+		if (dio->lock_type == DIO_LOCKING)
+			/* lockdep: not the owner will release it */
+			down_read_non_owner(&inode->i_alloc_sem);
+	}
+
+	return 0;
+}
+
 /*
  * Releases both i_mutex and i_alloc_sem
  */
@@ -1172,8 +1212,6 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	ssize_t retval = -EINVAL;
 	loff_t end = offset;
 	struct dio *dio;
-	int release_i_mutex = 0;
-	int acquire_i_mutex = 0;
 
 	if (rw & WRITE)
 		rw = WRITE_ODIRECT;
@@ -1200,42 +1238,10 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	if (!dio)
 		goto out;
 
-	/*
-	 * For block device access DIO_NO_LOCKING is used,
-	 *	neither readers nor writers do any locking at all
-	 * For regular files using DIO_LOCKING,
-	 *	readers need to grab i_mutex and i_alloc_sem
-	 *	writers need to grab i_alloc_sem only (i_mutex is already held)
-	 * For regular files using DIO_OWN_LOCKING,
-	 *	neither readers nor writers take any locks here
-	 */
-	if (dio_lock_type != DIO_NO_LOCKING) {
-		/* watch out for a 0 len io from a tricksy fs */
-		if (rw == READ && end > offset) {
-			struct address_space *mapping;
-
-			mapping = iocb->ki_filp->f_mapping;
-			if (dio_lock_type != DIO_OWN_LOCKING) {
-				mutex_lock(&inode->i_mutex);
-				release_i_mutex = 1;
-			}
-
-			retval = filemap_write_and_wait_range(mapping, offset,
-							      end - 1);
-			if (retval) {
-				kfree(dio);
-				goto out;
-			}
-
-			if (dio_lock_type == DIO_OWN_LOCKING) {
-				mutex_unlock(&inode->i_mutex);
-				acquire_i_mutex = 1;
-			}
-		}
-
-		if (dio_lock_type == DIO_LOCKING)
-			/* lockdep: not the owner will release it */
-			down_read_non_owner(&inode->i_alloc_sem);
+	retval = dio_lock_and_flush(dio, offset, end);
+	if (retval) {
+		kfree(dio);
+		goto out;
 	}
 
 	retval = direct_io_worker(rw, iocb, inode, iov, offset,
@@ -1254,14 +1260,11 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 			vmtruncate(inode, isize);
 	}
 
-	if (rw == READ && dio_lock_type == DIO_LOCKING)
-		release_i_mutex = 0;
-
-out:
-	if (release_i_mutex)
-		mutex_unlock(&inode->i_mutex);
-	else if (acquire_i_mutex)
+	/* re-acquire the lock that was dropped in dio_lock_and_flush() */
+	if (dio_lock_type == DIO_OWN_LOCKING && rw == READ && end > offset)
 		mutex_lock(&inode->i_mutex);
+out:
+
 	return retval;
 }
 EXPORT_SYMBOL(__blockdev_direct_IO);
