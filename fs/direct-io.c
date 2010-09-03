@@ -926,6 +926,34 @@ out:
 }
 
 /*
+ * Returns true if the given offset is aligned to either the IO size
+ * specified by the given blkbits or by the logical block size of the
+ * given block device.
+ *
+ * If the given offset isn't aligned to the blkbits arguments as this is
+ * called then blkbits is set to the block size of the specified block
+ * device.  The call can then return either true or false.
+ *
+ * This bizarre calling convention matches the code paths that
+ * duplicated the functionality that this helper was built from.  We
+ * reproduce the behaviour to avoid introducing subtle bugs.
+ */
+static int dio_aligned(unsigned long offset, unsigned *blkbits,
+		       struct block_device *bdev)
+{
+	unsigned mask = (1 << *blkbits) - 1;
+
+	if (offset & mask) {
+		if (bdev)
+			*blkbits = blksize_bits(bdev_logical_block_size(bdev));
+		mask = (1 << *blkbits) - 1;
+		return !(offset & mask);
+	}
+
+	return 1;
+}
+
+/*
  * Releases both i_mutex and i_alloc_sem
  */
 static ssize_t
@@ -1115,8 +1143,6 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	size_t size;
 	unsigned long addr;
 	unsigned blkbits = inode->i_blkbits;
-	unsigned bdev_blkbits = 0;
-	unsigned blocksize_mask = (1 << blkbits) - 1;
 	ssize_t retval = -EINVAL;
 	loff_t end = offset;
 	struct dio *dio;
@@ -1126,15 +1152,9 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	if (rw & WRITE)
 		rw = WRITE_ODIRECT;
 
-	if (bdev)
-		bdev_blkbits = blksize_bits(bdev_logical_block_size(bdev));
-
-	if (offset & blocksize_mask) {
-		if (bdev)
-			 blkbits = bdev_blkbits;
-		blocksize_mask = (1 << blkbits) - 1;
-		if (offset & blocksize_mask)
-			goto out;
+	if (!dio_aligned(offset, &blkbits, bdev)) {
+		retval = -EINVAL;
+		goto out;
 	}
 
 	/* Check the memory alignment.  Blocks cannot straddle pages */
@@ -1142,12 +1162,9 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 		addr = (unsigned long)iov[seg].iov_base;
 		size = iov[seg].iov_len;
 		end += size;
-		if ((addr & blocksize_mask) || (size & blocksize_mask))  {
-			if (bdev)
-				 blkbits = bdev_blkbits;
-			blocksize_mask = (1 << blkbits) - 1;
-			if ((addr & blocksize_mask) || (size & blocksize_mask))  
-				goto out;
+		if (!dio_aligned(addr|size, &blkbits, bdev)) {
+			retval = -EINVAL;
+			goto out;
 		}
 	}
 
