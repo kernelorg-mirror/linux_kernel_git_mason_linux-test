@@ -969,30 +969,6 @@ direct_io_worker(int rw, struct kiocb *iocb, struct inode *inode,
 	ssize_t ret2;
 	size_t bytes;
 
-	dio->inode = inode;
-	dio->rw = rw;
-	dio->blkbits = blkbits;
-	dio->blkfactor = inode->i_blkbits - blkbits;
-	dio->block_in_file = offset >> blkbits;
-
-	dio->get_block = get_block;
-	dio->end_io = end_io;
-	dio->final_block_in_bio = -1;
-	dio->next_block_for_io = -1;
-
-	dio->iocb = iocb;
-	dio->i_size = i_size_read(inode);
-
-	spin_lock_init(&dio->bio_lock);
-	dio->refcount = 1;
-
-	/*
-	 * In case of non-aligned buffers, we may need 2 more
-	 * pages since we need to zero out first and last block.
-	 */
-	if (unlikely(dio->blkfactor))
-		dio->pages_in_io = 2;
-
 	for (seg = 0; seg < nr_segs; seg++) {
 		user_addr = (unsigned long)iov[seg].iov_base;
 		dio->pages_in_io +=
@@ -1112,6 +1088,56 @@ direct_io_worker(int rw, struct kiocb *iocb, struct inode *inode,
 	return ret;
 }
 
+static struct dio *dio_alloc_init(int rw, struct kiocb *iocb,
+				  struct inode *inode, loff_t offset,
+				  unsigned blkbits, get_block_t get_block,
+				  dio_iodone_t end_io, int dio_lock_type,
+				  loff_t end)
+{
+	struct dio *dio;
+
+	dio = kzalloc(sizeof(*dio), GFP_KERNEL);
+	if (!dio)
+		return NULL;
+
+	dio->lock_type = dio_lock_type;
+
+	/*
+	 * For file extending writes updating i_size before data
+	 * writeouts complete can expose uninitialized blocks. So
+	 * even for AIO, we need to wait for i/o to complete before
+	 * returning in this case.
+	 */
+	dio->is_async = !is_sync_kiocb(iocb) && !((rw & WRITE) &&
+		(end > i_size_read(inode)));
+
+	dio->inode = inode;
+	dio->rw = rw;
+	dio->blkbits = blkbits;
+	dio->blkfactor = inode->i_blkbits - blkbits;
+	dio->block_in_file = offset >> blkbits;
+
+	dio->get_block = get_block;
+	dio->end_io = end_io;
+	dio->final_block_in_bio = -1;
+	dio->next_block_for_io = -1;
+
+	dio->iocb = iocb;
+	dio->i_size = i_size_read(inode);
+
+	spin_lock_init(&dio->bio_lock);
+	dio->refcount = 1;
+
+	/*
+	 * In case of non-aligned buffers, we may need 2 more
+	 * pages since we need to zero out first and last block.
+	 */
+	if (unlikely(dio->blkfactor))
+		dio->pages_in_io = 2;
+
+	return dio;
+}
+
 /*
  * This is a library function for use by filesystem drivers.
  * The locking rules are governed by the dio_lock_type parameter.
@@ -1168,7 +1194,8 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 		}
 	}
 
-	dio = kzalloc(sizeof(*dio), GFP_KERNEL);
+	dio = dio_alloc_init(rw, iocb, inode, offset, blkbits, get_block,
+			     end_io, dio_lock_type, end);
 	retval = -ENOMEM;
 	if (!dio)
 		goto out;
@@ -1182,7 +1209,6 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	 * For regular files using DIO_OWN_LOCKING,
 	 *	neither readers nor writers take any locks here
 	 */
-	dio->lock_type = dio_lock_type;
 	if (dio_lock_type != DIO_NO_LOCKING) {
 		/* watch out for a 0 len io from a tricksy fs */
 		if (rw == READ && end > offset) {
@@ -1211,15 +1237,6 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 			/* lockdep: not the owner will release it */
 			down_read_non_owner(&inode->i_alloc_sem);
 	}
-
-	/*
-	 * For file extending writes updating i_size before data
-	 * writeouts complete can expose uninitialized blocks. So
-	 * even for AIO, we need to wait for i/o to complete before
-	 * returning in this case.
-	 */
-	dio->is_async = !is_sync_kiocb(iocb) && !((rw & WRITE) &&
-		(end > i_size_read(inode)));
 
 	retval = direct_io_worker(rw, iocb, inode, iov, offset,
 				nr_segs, blkbits, get_block, end_io, dio);
