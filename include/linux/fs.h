@@ -677,6 +677,8 @@ struct address_space_operations {
 	int (*releasepage) (struct page *, gfp_t);
 	ssize_t (*direct_IO)(int, struct kiocb *, const struct iovec *iov,
 			loff_t offset, unsigned long nr_segs);
+	ssize_t (*direct_IO_bvec)(int, struct kiocb *, struct bio_vec *bvec,
+			loff_t offset, unsigned long bvec_len);
 	int (*get_xip_mem)(struct address_space *, pgoff_t, int,
 						void **, unsigned long *);
 	/* migrate the contents of a page to the specified target */
@@ -2386,6 +2388,38 @@ static inline ssize_t blockdev_direct_IO_own_locking(int rw, struct kiocb *iocb,
 {
 	return __blockdev_direct_IO(rw, iocb, inode, bdev, iov, offset,
 				nr_segs, get_block, end_io, DIO_OWN_LOCKING);
+}
+
+ssize_t __blockdev_direct_IO_bvec(int rw, struct kiocb *iocb, struct inode *inode,
+	struct block_device *bdev, struct bio_vec *bvec, loff_t offset,
+	unsigned long bvec_len, get_block_t get_block, dio_iodone_t end_io,
+	int lock_type);
+
+static inline ssize_t blockdev_direct_IO_bvec(int rw, struct kiocb *iocb,
+	struct inode *inode, struct block_device *bdev, struct bio_vec *bvec,
+	loff_t offset, unsigned long bvec_len, get_block_t get_block,
+	dio_iodone_t end_io)
+{
+	return __blockdev_direct_IO_bvec(rw, iocb, inode, bdev, bvec, offset,
+				bvec_len, get_block, end_io, DIO_LOCKING);
+}
+
+static inline ssize_t blockdev_direct_IO_bvec_no_locking(int rw, struct kiocb *iocb,
+	struct inode *inode, struct block_device *bdev, struct bio_vec *bvec,
+	loff_t offset, unsigned long bvec_len, get_block_t get_block,
+	dio_iodone_t end_io)
+{
+	return __blockdev_direct_IO_bvec(rw, iocb, inode, bdev, bvec, offset,
+				bvec_len, get_block, end_io, DIO_NO_LOCKING);
+}
+
+static inline ssize_t blockdev_direct_IO_bvec_own_locking(int rw, struct kiocb *iocb,
+	struct inode *inode, struct block_device *bdev, struct bio_vec *bvec,
+	loff_t offset, unsigned long bvec_len, get_block_t get_block,
+	dio_iodone_t end_io)
+{
+	return __blockdev_direct_IO_bvec(rw, iocb, inode, bdev, bvec, offset,
+				bvec_len, get_block, end_io, DIO_OWN_LOCKING);
 }
 #endif
 

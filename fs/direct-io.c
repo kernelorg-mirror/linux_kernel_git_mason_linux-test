@@ -129,6 +129,7 @@ struct dio {
 	/* AIO related stuff */
 	struct kiocb *iocb;		/* kiocb */
 	int is_async;			/* is IO async ? */
+	int should_dirty;		/* should we mark read pages dirty? */
 	int io_error;			/* IO error in completion path */
 	ssize_t result;                 /* IO result */
 };
@@ -337,7 +338,7 @@ static void dio_bio_submit(struct dio *dio)
 	dio->refcount++;
 	spin_unlock_irqrestore(&dio->bio_lock, flags);
 
-	if (dio->is_async && dio->rw == READ)
+	if (dio->is_async && dio->rw == READ && dio->should_dirty)
 		bio_set_pages_dirty(bio);
 
 	submit_bio(dio->rw, bio);
@@ -403,13 +404,14 @@ static int dio_bio_complete(struct dio *dio, struct bio *bio)
 	if (!uptodate)
 		dio->io_error = -EIO;
 
-	if (dio->is_async && dio->rw == READ) {
+	if (dio->is_async && dio->rw == READ && dio->should_dirty) {
 		bio_check_pages_dirty(bio);	/* transfers ownership */
 	} else {
 		for (page_no = 0; page_no < bio->bi_vcnt; page_no++) {
 			struct page *page = bvec[page_no].bv_page;
 
-			if (dio->rw == READ && !PageCompound(page))
+			if (dio->rw == READ && !PageCompound(page) &&
+			    dio->should_dirty)
 				set_page_dirty_lock(page);
 			page_cache_release(page);
 		}
@@ -1214,6 +1216,8 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 		goto out;
 	}
 
+	dio->should_dirty = 1;
+
 	for (seg = 0; seg < nr_segs; seg++) {
 		user_addr = (unsigned long)iov[seg].iov_base;
 		dio->pages_in_io +=
@@ -1261,3 +1265,83 @@ out:
 	return retval;
 }
 EXPORT_SYMBOL(__blockdev_direct_IO);
+
+ssize_t
+__blockdev_direct_IO_bvec(int rw, struct kiocb *iocb, struct inode *inode,
+	struct block_device *bdev, struct bio_vec *bvec, loff_t offset,
+	unsigned long bvec_len, get_block_t get_block,
+	dio_iodone_t end_io, int dio_lock_type)
+{
+	unsigned blkbits = inode->i_blkbits;
+	ssize_t retval = -EINVAL;
+	loff_t end = offset;
+	struct dio *dio;
+	unsigned long i;
+
+	if (rw & WRITE)
+		rw = WRITE_ODIRECT;
+
+	if (!dio_aligned(offset, &blkbits, bdev)) {
+		retval = -EINVAL;
+		goto out;
+	}
+
+	/* Check the memory alignment.  Blocks cannot straddle pages */
+	for (i = 0; i < bvec_len; i++) {
+		end += bvec[i].bv_len;
+		if (!dio_aligned(bvec[i].bv_len | bvec[i].bv_offset,
+				 &blkbits, bdev)) {
+			retval = -EINVAL;
+			goto out;
+		}
+	}
+
+	dio = dio_alloc_init(rw, iocb, inode, offset, blkbits, get_block,
+			     end_io, dio_lock_type, end);
+	retval = -ENOMEM;
+	if (!dio)
+		goto out;
+
+	retval = dio_lock_and_flush(dio, offset, end);
+	if (retval) {
+		kfree(dio);
+		goto out;
+	}
+
+	dio->pages_in_io = bvec_len;
+
+	for (i = 0; i < bvec_len; i++) {
+		dio->size += bvec[i].bv_len;
+
+		/* Index into the first page of the first block */
+		dio->first_block_in_page = bvec[i].bv_offset >> blkbits;
+		dio->final_block_in_request = dio->block_in_file +
+						(bvec[i].bv_len  >> blkbits);
+		/* Page fetching state */
+		dio->curr_page = 0;
+		page_cache_get(bvec[i].bv_page);
+		dio->pages[0] = bvec[i].bv_page;
+		dio->head = 0;
+		dio->tail = 1;
+
+		dio->total_pages = 1;
+		dio->curr_user_address = 0;
+
+		retval = do_direct_IO(dio);
+
+		dio->result += bvec[i].bv_len -
+			((dio->final_block_in_request - dio->block_in_file) <<
+					blkbits);
+
+		if (retval) {
+			dio_cleanup(dio);
+			break;
+		}
+	}
+
+	retval = dio_post_submission(rw, iocb, inode, offset, blkbits,
+				     get_block, end_io, dio, end, retval);
+out:
+	return retval;
+}
+EXPORT_SYMBOL(__blockdev_direct_IO_bvec);
