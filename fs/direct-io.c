@@ -1003,10 +1003,8 @@ direct_io_worker(int rw, struct kiocb *iocb, struct inode *inode,
 	struct dio *dio)
 {
 	unsigned long user_addr; 
-	unsigned long flags;
 	int seg;
 	ssize_t ret = 0;
-	ssize_t ret2;
 	size_t bytes;
 
 	for (seg = 0; seg < nr_segs; seg++) {
@@ -1048,6 +1046,18 @@ direct_io_worker(int rw, struct kiocb *iocb, struct inode *inode,
 			break;
 		}
 	} /* end iovec loop */
+
+	return ret;
+}
+
+static ssize_t dio_post_submission(int rw, struct kiocb *iocb,
+				   struct inode *inode, loff_t offset,
+				   unsigned blkbits, get_block_t get_block,
+				   dio_iodone_t end_io, struct dio *dio,
+				   loff_t end, ssize_t ret)
+{
+	unsigned long flags;
+	ssize_t ret2;
 
 	if (ret == -ENOTBLK && (rw & WRITE)) {
 		/*
@@ -1124,6 +1134,23 @@ direct_io_worker(int rw, struct kiocb *iocb, struct inode *inode,
 		kfree(dio);
 	} else
 		BUG_ON(ret != -EIOCBQUEUED);
+
+	/*
+	 * In case of error extending write may have instantiated a few
+	 * blocks outside i_size. Trim these off again for DIO_LOCKING.
+	 * NOTE: DIO_NO_LOCK/DIO_OWN_LOCK callers have to handle this by
+	 * it's own meaner.
+	 */
+	if (unlikely(ret < 0 && (rw & WRITE))) {
+		loff_t isize = i_size_read(inode);
+
+		if (end > isize && dio->lock_type == DIO_LOCKING)
+			vmtruncate(inode, isize);
+	}
+
+	/* re-acquire the lock that was dropped in dio_lock_and_flush() */
+	if (dio->lock_type == DIO_OWN_LOCKING && rw == READ && end > offset)
+		mutex_lock(&inode->i_mutex);
 
 	return ret;
 }
@@ -1246,23 +1273,8 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 
 	retval = direct_io_worker(rw, iocb, inode, iov, offset,
 				nr_segs, blkbits, get_block, end_io, dio);
-
-	/*
-	 * In case of error extending write may have instantiated a few
-	 * blocks outside i_size. Trim these off again for DIO_LOCKING.
-	 * NOTE: DIO_NO_LOCK/DIO_OWN_LOCK callers have to handle this by
-	 * it's own meaner.
-	 */
-	if (unlikely(retval < 0 && (rw & WRITE))) {
-		loff_t isize = i_size_read(inode);
-
-		if (end > isize && dio_lock_type == DIO_LOCKING)
-			vmtruncate(inode, isize);
-	}
-
-	/* re-acquire the lock that was dropped in dio_lock_and_flush() */
-	if (dio_lock_type == DIO_OWN_LOCKING && rw == READ && end > offset)
-		mutex_lock(&inode->i_mutex);
+	retval = dio_post_submission(rw, iocb, inode, offset, blkbits,
+				     get_block, end_io, dio, end, retval);
 out:
 
 	return retval;
