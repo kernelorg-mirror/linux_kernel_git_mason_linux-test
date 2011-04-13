@@ -2144,11 +2144,11 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
 	BUG_ON(ret);
 	btrfs_wait_marked_extents(log, &log->dirty_log_pages, mark);
 
-	btrfs_set_super_log_root(&root->fs_info->super_for_commit,
+	btrfs_set_super_log_root(root->fs_info->super_for_commit,
 				log_root_tree->node->start);
-	btrfs_set_super_log_root_level(&root->fs_info->super_for_commit,
+	btrfs_set_super_log_root_level(root->fs_info->super_for_commit,
 				btrfs_header_level(log_root_tree->node));
-	btrfs_set_super_log_root_transid(&root->fs_info->super_for_commit,
+	btrfs_set_super_log_root_transid(root->fs_info->super_for_commit,
 					 running_subtransid);
 	if (btrfs_header_generation(log_root_tree->node) != trans->transaction->transid) {
 		printk("warning bad generation on the log root wanted %Lu got %Lu\n", trans->transaction->transid, btrfs_header_generation(log_root_tree->node));
