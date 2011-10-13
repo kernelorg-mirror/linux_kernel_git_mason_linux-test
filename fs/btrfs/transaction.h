@@ -23,6 +23,7 @@
 
 struct btrfs_transaction {
 	u64 transid;
+	u64 sub_transid;
 	/*
 	 * total writers in this transaction, it must be zero before the
 	 * transaction can end
@@ -72,8 +73,28 @@ struct btrfs_pending_snapshot {
 static inline void btrfs_set_inode_last_trans(struct btrfs_trans_handle *trans,
 					      struct inode *inode)
 {
-	BTRFS_I(inode)->last_trans = trans->transaction->transid;
-	BTRFS_I(inode)->last_sub_trans = BTRFS_I(inode)->root->log_transid;
+	spin_lock(&BTRFS_I(inode)->sub_trans_lock);
+	if (BTRFS_I(inode)->first_sub_trans == 0)
+		BTRFS_I(inode)->first_sub_trans = trans->transid;
+	spin_unlock(&BTRFS_I(inode)->sub_trans_lock);
+
+	BTRFS_I(inode)->last_trans = trans->transid;
+}
+
+static inline u64 btrfs_transid_for_header(struct btrfs_trans_handle *trans,
+					   struct btrfs_root *root,
+					   struct extent_buffer *eb)
+{
+	/* the root of the log tree must not have a sub-transid
+	 * as its generation.  It confuses older filesystems
+	 */
+	if (root->root_key.objectid == BTRFS_TREE_LOG_OBJECTID &&
+	    eb == root->node) {
+		return trans->transaction->transid;
+	} else {
+		smp_rmb();
+		return trans->transaction->sub_transid;
+	}
 }
 
 int btrfs_end_transaction(struct btrfs_trans_handle *trans,

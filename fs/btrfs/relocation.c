@@ -469,7 +469,7 @@ static int update_backref_cache(struct btrfs_trans_handle *trans,
 		return 0;
 	}
 
-	if (cache->last_trans == trans->transid)
+	if (cache->last_trans >= trans->transaction->transid)
 		return 0;
 
 	/*
@@ -1281,7 +1281,7 @@ static struct btrfs_root *create_reloc_root(struct btrfs_trans_handle *trans,
 		BUG_ON(ret);
 
 		btrfs_set_root_last_snapshot(&root->root_item,
-					     trans->transid - 1);
+					     trans->transaction->transid - 1);
 	} else {
 		/*
 		 * called by btrfs_reloc_post_snapshot_hook.
@@ -2269,7 +2269,7 @@ static int record_reloc_root_in_trans(struct btrfs_trans_handle *trans,
 {
 	struct btrfs_root *root;
 
-	if (reloc_root->last_trans == trans->transid)
+	if (reloc_root->last_trans >= trans->transaction->transid)
 		return 0;
 
 	root = read_fs_root(reloc_root->fs_info, reloc_root->root_key.offset);
@@ -2549,7 +2549,7 @@ static int do_relocation(struct btrfs_trans_handle *trans,
 			btrfs_set_node_blockptr(upper->eb, slot,
 						node->eb->start);
 			btrfs_set_node_ptr_generation(upper->eb, slot,
-						      trans->transid);
+					      btrfs_header_generation(node->eb));
 			btrfs_mark_buffer_dirty(upper->eb);
 
 			ret = btrfs_inc_extent_ref(trans, root,

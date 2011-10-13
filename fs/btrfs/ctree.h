@@ -919,6 +919,7 @@ struct btrfs_fs_info {
 	struct btrfs_block_rsv empty_block_rsv;
 
 	u64 generation;
+	u64 sub_generation;
 	u64 last_trans_committed;
 
 	/*
@@ -1154,7 +1155,6 @@ struct btrfs_root {
 	atomic_t log_writers;
 	atomic_t log_commit[2];
 	unsigned long log_transid;
-	unsigned long last_log_commit;
 	unsigned long log_batch;
 	pid_t log_start_pid;
 	bool log_multiple_pids;
@@ -2613,7 +2613,8 @@ int btrfs_drop_extent_cache(struct inode *inode, u64 start, u64 end,
 			    int skip_pinned);
 extern const struct file_operations btrfs_file_operations;
 int btrfs_drop_extents(struct btrfs_trans_handle *trans, struct inode *inode,
-		       u64 start, u64 end, u64 *hint_byte, int drop_cache);
+		       u64 start, u64 end, u64 *hint_byte, int drop_cache,
+		       int log);
 int btrfs_mark_extent_written(struct btrfs_trans_handle *trans,
 			      struct inode *inode, u64 start, u64 end);
 int btrfs_release_file(struct inode *inode, struct file *file);

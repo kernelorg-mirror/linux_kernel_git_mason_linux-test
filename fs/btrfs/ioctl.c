@@ -2394,7 +2394,7 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 				ret = btrfs_drop_extents(trans, inode,
 							 new_key.offset,
 							 new_key.offset + datal,
-							 &hint_byte, 1);
+							 &hint_byte, 1, 0);
 				BUG_ON(ret);
 
 				ret = btrfs_insert_empty_item(trans, root, path,
@@ -2449,7 +2449,7 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
 				ret = btrfs_drop_extents(trans, inode,
 							 new_key.offset,
 							 new_key.offset + datal,
-							 &hint_byte, 1);
+							 &hint_byte, 1, 0);
 				BUG_ON(ret);
 
 				ret = btrfs_insert_empty_item(trans, root, path,
@@ -2811,7 +2811,7 @@ static noinline long btrfs_ioctl_start_sync(struct file *file, void __user *argp
 	trans = btrfs_start_transaction(root, 0);
 	if (IS_ERR(trans))
 		return PTR_ERR(trans);
-	transid = trans->transid;
+	transid = trans->transaction->transid;
 	ret = btrfs_commit_transaction_async(trans, root, 0);
 	if (ret) {
 		btrfs_end_transaction(trans, root);

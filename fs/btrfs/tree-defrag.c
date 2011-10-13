@@ -139,7 +139,7 @@ done:
 	if (ret != -EAGAIN) {
 		memset(&root->defrag_progress, 0,
 		       sizeof(root->defrag_progress));
-		root->defrag_trans_start = trans->transid;
+		root->defrag_trans_start = trans->transaction->transid;
 	}
 	return ret;
 }

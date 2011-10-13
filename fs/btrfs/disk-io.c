@@ -1035,7 +1035,7 @@ int clean_tree_block(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 		     struct extent_buffer *buf)
 {
 	struct inode *btree_inode = root->fs_info->btree_inode;
-	if (btrfs_header_generation(buf) ==
+	if (btrfs_header_generation(buf) >=
 	    root->fs_info->running_transaction->transid) {
 		btrfs_assert_tree_locked(buf);
 
@@ -1099,7 +1099,6 @@ static int __setup_root(u32 nodesize, u32 leafsize, u32 sectorsize,
 	atomic_set(&root->log_writers, 0);
 	root->log_batch = 0;
 	root->log_transid = 0;
-	root->last_log_commit = 0;
 	extent_io_tree_init(&root->dirty_log_pages,
 			     fs_info->btree_inode->i_mapping);
 
@@ -1231,7 +1230,6 @@ int btrfs_add_log_tree(struct btrfs_trans_handle *trans,
 	WARN_ON(root->log_root);
 	root->log_root = log_root;
 	root->log_transid = 0;
-	root->last_log_commit = 0;
 	return 0;
 }
 
@@ -1554,7 +1552,7 @@ static int transaction_kthread(void *arg)
 
 		trans = btrfs_join_transaction(root);
 		BUG_ON(IS_ERR(trans));
-		if (transid == trans->transid) {
+		if (transid == trans->transaction->transid) {
 			ret = btrfs_commit_transaction(trans, root);
 			BUG_ON(ret);
 		} else {
@@ -1996,6 +1994,7 @@ struct btrfs_root *open_ctree(struct super_block *sb,
 	csum_root->track_dirty = 1;
 
 	fs_info->generation = generation;
+	fs_info->sub_generation = generation;
 	fs_info->last_trans_committed = generation;
 	fs_info->data_alloc_profile = (u64)-1;
 	fs_info->metadata_alloc_profile = (u64)-1;
@@ -2035,7 +2034,8 @@ struct btrfs_root *open_ctree(struct super_block *sb,
 	/* do not make disk changes in broken FS */
 	if (btrfs_super_log_root(disk_super) != 0 &&
 	    !(fs_info->fs_state & BTRFS_SUPER_FLAG_ERROR)) {
-		u64 bytenr = btrfs_super_log_root(disk_super);
+		u64 bytenr;
+		u64 log_root_transid;
 
 		if (fs_devices->rw_devices == 0) {
 			printk(KERN_WARNING "Btrfs log replay required "
@@ -2056,9 +2056,49 @@ struct btrfs_root *open_ctree(struct super_block *sb,
 		__setup_root(nodesize, leafsize, sectorsize, stripesize,
 			     log_tree_root, fs_info, BTRFS_TREE_LOG_OBJECTID);
 
+		bytenr = btrfs_super_log_root(disk_super);
+
+		/* for old btrfs, we need to do something compatible. */
+		if (btrfs_super_log_root_transid(disk_super))
+			log_root_transid =
+				btrfs_super_log_root_transid(disk_super);
+		else
+			log_root_transid = generation;
+
+		/*
+		 * since older versions of btrfs were not using
+		 * the log_root_transid field, we can't use it here
+		 * to decide what the generation field of the log root tree
+		 * should be.
+		 *
+		 * The tree log root always has a transid of generation + 1,
+		 * and we use the log_root_transid to remember the last
+		 * sub trans.  This is important so that any new transactions
+		 * we start won't reuse those transids, which would give us
+		 * the chance to miss lost writes
+		 */
+		log_root_transid = max(log_root_transid, generation);
+
 		log_tree_root->node = read_tree_block(tree_root, bytenr,
 						      blocksize,
 						      generation + 1);
+		if (!log_tree_root->node)
+			goto fail_trans_kthread;;
+
+		if (!btrfs_buffer_uptodate(log_tree_root->node,
+					   generation + 1)) {
+			printk(KERN_WARNING "btrfs: failed to read log tree root on %s\n",
+			       sb->s_id);
+			free_extent_buffer(log_tree_root->node);
+			goto fail_trans_kthread;
+		}
+
+		/* make sure any new transactions start after our sub transid */
+		generation = log_root_transid;
+		fs_info->generation = log_root_transid;
+		fs_info->sub_generation = log_root_transid;
+		fs_info->last_trans_committed = log_root_transid;
+
 		ret = btrfs_recover_log_trees(log_tree_root);
 		BUG_ON(ret);
 
@@ -2664,7 +2704,7 @@ void btrfs_mark_buffer_dirty(struct extent_buffer *buf)
 	int was_dirty;
 
 	btrfs_assert_tree_locked(buf);
-	if (transid != root->fs_info->generation) {
+	if (transid < root->fs_info->generation) {
 		printk(KERN_CRIT "btrfs transid mismatch buffer %llu, "
 		       "found %llu running %llu\n",
 			(unsigned long long)buf->start,

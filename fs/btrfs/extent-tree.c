@@ -4791,7 +4791,7 @@ void btrfs_free_tree_block(struct btrfs_trans_handle *trans,
 
 	cache = btrfs_lookup_block_group(root->fs_info, buf->start);
 
-	if (btrfs_header_generation(buf) == trans->transid) {
+	if (btrfs_header_generation(buf) >= trans->transaction->transid) {
 		if (root->root_key.objectid != BTRFS_TREE_LOG_OBJECTID) {
 			ret = check_ref_cleanup(trans, root, buf->start);
 			if (!ret)
@@ -6250,7 +6250,8 @@ static noinline int walk_up_proc(struct btrfs_trans_handle *trans,
 		}
 		/* make block locked assertion in clean_tree_block happy */
 		if (!path->locks[level] &&
-		    btrfs_header_generation(eb) == trans->transid) {
+		    btrfs_header_generation(eb) >=
+						 trans->transaction->transid) {
 			btrfs_tree_lock(eb);
 			btrfs_set_lock_blocking(eb);
 			path->locks[level] = BTRFS_WRITE_LOCK_BLOCKING;

@@ -155,7 +155,8 @@ static noinline int insert_inline_extent(struct btrfs_trans_handle *trans,
 	leaf = path->nodes[0];
 	ei = btrfs_item_ptr(leaf, path->slots[0],
 			    struct btrfs_file_extent_item);
-	btrfs_set_file_extent_generation(leaf, ei, trans->transid);
+	btrfs_set_file_extent_generation(leaf, ei,
+					 trans->transaction->sub_transid);
 	btrfs_set_file_extent_type(leaf, ei, BTRFS_FILE_EXTENT_INLINE);
 	btrfs_set_file_extent_encryption(leaf, ei, 0);
 	btrfs_set_file_extent_other_encoding(leaf, ei, 0);
@@ -246,7 +247,7 @@ static noinline int cow_file_range_inline(struct btrfs_trans_handle *trans,
 	}
 
 	ret = btrfs_drop_extents(trans, inode, start, aligned_end,
-				 &hint_byte, 1);
+				 &hint_byte, 1, 0);
 	BUG_ON(ret);
 
 	if (isize > actual_end)
@@ -1661,7 +1662,7 @@ static int insert_reserved_file_extent(struct btrfs_trans_handle *trans,
 	 * with the others.
 	 */
 	ret = btrfs_drop_extents(trans, inode, file_pos, file_pos + num_bytes,
-				 &hint, 0);
+				 &hint, 0, 0);
 	BUG_ON(ret);
 
 	ins.objectid = btrfs_ino(inode);
@@ -1672,7 +1673,8 @@ static int insert_reserved_file_extent(struct btrfs_trans_handle *trans,
 	leaf = path->nodes[0];
 	fi = btrfs_item_ptr(leaf, path->slots[0],
 			    struct btrfs_file_extent_item);
-	btrfs_set_file_extent_generation(leaf, fi, trans->transid);
+	btrfs_set_file_extent_generation(leaf, fi,
+					 trans->transaction->sub_transid);
 	btrfs_set_file_extent_type(leaf, fi, extent_type);
 	btrfs_set_file_extent_disk_bytenr(leaf, fi, disk_bytenr);
 	btrfs_set_file_extent_disk_num_bytes(leaf, fi, disk_num_bytes);
@@ -3453,7 +3455,7 @@ int btrfs_cont_expand(struct inode *inode, loff_t oldsize, loff_t size)
 
 			err = btrfs_drop_extents(trans, inode, cur_offset,
 						 cur_offset + hole_size,
-						 &hint_byte, 1);
+						 &hint_byte, 1, 0);
 			if (err) {
 				btrfs_end_transaction(trans, root);
 				break;
@@ -6499,8 +6501,7 @@ again:
 	set_page_dirty(page);
 	SetPageUptodate(page);
 
-	BTRFS_I(inode)->last_trans = root->fs_info->generation;
-	BTRFS_I(inode)->last_sub_trans = BTRFS_I(inode)->root->log_transid;
+	BTRFS_I(inode)->last_trans = root->fs_info->sub_generation;
 
 	unlock_extent_cached(io_tree, page_start, page_end, &cached_state, GFP_NOFS);
 
@@ -6732,8 +6733,8 @@ struct inode *btrfs_alloc_inode(struct super_block *sb)
 	ei->space_info = NULL;
 	ei->generation = 0;
 	ei->sequence = 0;
+	ei->first_sub_trans = 0;
 	ei->last_trans = 0;
-	ei->last_sub_trans = 0;
 	ei->logged_trans = 0;
 	ei->delalloc_bytes = 0;
 	ei->disk_i_size = 0;
@@ -6759,6 +6760,7 @@ struct inode *btrfs_alloc_inode(struct super_block *sb)
 	extent_io_tree_init(&ei->io_tree, &inode->i_data);
 	extent_io_tree_init(&ei->io_failure_tree, &inode->i_data);
 	mutex_init(&ei->log_mutex);
+	spin_lock_init(&ei->sub_trans_lock);
 	btrfs_ordered_inode_tree_init(&ei->ordered_tree);
 	INIT_LIST_HEAD(&ei->i_orphan);
 	INIT_LIST_HEAD(&ei->delalloc_inodes);
@@ -7222,7 +7224,8 @@ static int btrfs_symlink(struct inode *dir, struct dentry *dentry,
 	leaf = path->nodes[0];
 	ei = btrfs_item_ptr(leaf, path->slots[0],
 			    struct btrfs_file_extent_item);
-	btrfs_set_file_extent_generation(leaf, ei, trans->transid);
+	btrfs_set_file_extent_generation(leaf, ei,
+					 trans->transaction->sub_transid);
 	btrfs_set_file_extent_type(leaf, ei,
 				   BTRFS_FILE_EXTENT_INLINE);
 	btrfs_set_file_extent_encryption(leaf, ei, 0);

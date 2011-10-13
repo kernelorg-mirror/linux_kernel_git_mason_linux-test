@@ -83,15 +83,19 @@ struct btrfs_inode {
 	/* sequence number for NFS changes */
 	u64 sequence;
 
+	/* used to avoid race of first_sub_trans */
+	spinlock_t sub_trans_lock;
+
+	/*
+	 * sub transid of the trans that first modified this inode before
+	 * a trans commit or a log sync
+	 */
+	u64 first_sub_trans;
+
 	/*
 	 * transid of the trans_handle that last modified this inode
 	 */
 	u64 last_trans;
-
-	/*
-	 * log transid when this inode was last modified
-	 */
-	u64 last_sub_trans;
 
 	/*
 	 * transid that last logged this inode

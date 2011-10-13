@@ -228,9 +228,9 @@ int btrfs_copy_root(struct btrfs_trans_handle *trans,
 	int level;
 	struct btrfs_disk_key disk_key;
 
-	WARN_ON(root->ref_cows && trans->transid !=
+	WARN_ON(root->ref_cows && trans->transaction->transid !=
 		root->fs_info->running_transaction->transid);
-	WARN_ON(root->ref_cows && trans->transid != root->last_trans);
+	WARN_ON(root->ref_cows && trans->transid < root->last_trans);
 
 	level = btrfs_header_level(buf);
 	if (level == 0)
@@ -246,7 +246,7 @@ int btrfs_copy_root(struct btrfs_trans_handle *trans,
 
 	copy_extent_buffer(cow, buf, 0, 0, cow->len);
 	btrfs_set_header_bytenr(cow, cow->start);
-	btrfs_set_header_generation(cow, trans->transid);
+	btrfs_set_header_generation(cow, trans->transaction->sub_transid);
 	btrfs_set_header_backref_rev(cow, BTRFS_MIXED_BACKREF_REV);
 	btrfs_clear_header_flag(cow, BTRFS_HEADER_FLAG_WRITTEN |
 				     BTRFS_HEADER_FLAG_RELOC);
@@ -425,9 +425,9 @@ static noinline int __btrfs_cow_block(struct btrfs_trans_handle *trans,
 
 	btrfs_assert_tree_locked(buf);
 
-	WARN_ON(root->ref_cows && trans->transid !=
+	WARN_ON(root->ref_cows && trans->transaction->transid !=
 		root->fs_info->running_transaction->transid);
-	WARN_ON(root->ref_cows && trans->transid != root->last_trans);
+	WARN_ON(root->ref_cows && trans->transid < root->last_trans);
 
 	level = btrfs_header_level(buf);
 
@@ -454,7 +454,15 @@ static noinline int __btrfs_cow_block(struct btrfs_trans_handle *trans,
 
 	copy_extent_buffer(cow, buf, 0, 0, cow->len);
 	btrfs_set_header_bytenr(cow, cow->start);
-	btrfs_set_header_generation(cow, trans->transid);
+
+	if (root->root_key.objectid == BTRFS_TREE_LOG_OBJECTID &&
+	    buf == root->node) {
+		btrfs_set_header_generation(cow, trans->transaction->transid);
+	} else {
+		btrfs_set_header_generation(cow,
+					    trans->transaction->sub_transid);
+	}
+
 	btrfs_set_header_backref_rev(cow, BTRFS_MIXED_BACKREF_REV);
 	btrfs_clear_header_flag(cow, BTRFS_HEADER_FLAG_WRITTEN |
 				     BTRFS_HEADER_FLAG_RELOC);
@@ -493,11 +501,12 @@ static noinline int __btrfs_cow_block(struct btrfs_trans_handle *trans,
 		else
 			parent_start = 0;
 
-		WARN_ON(trans->transid != btrfs_header_generation(parent));
+		WARN_ON(btrfs_header_generation(parent) <
+						trans->transaction->transid);
 		btrfs_set_node_blockptr(parent, parent_slot,
 					cow->start);
 		btrfs_set_node_ptr_generation(parent, parent_slot,
-					      trans->transid);
+					      btrfs_header_generation(cow));
 		btrfs_mark_buffer_dirty(parent);
 		btrfs_free_tree_block(trans, root, buf, parent_start,
 				      last_ref);
@@ -510,11 +519,59 @@ static noinline int __btrfs_cow_block(struct btrfs_trans_handle *trans,
 	return 0;
 }
 
+static inline int must_update_generation(struct btrfs_trans_handle *trans,
+					   struct btrfs_root *root,
+					   struct extent_buffer *buf)
+{
+	u64 transid;
+
+	transid = btrfs_transid_for_header(trans, root, buf);
+
+	/*
+	 * If it does not need to cow this block, we still need to
+	 * update the block's generation, for transid may have been
+	 * changed during fsync.
+	*/
+	if (btrfs_header_generation(buf) == transid)
+		return 0;
+	return 1;
+}
+
+static inline void update_block_generation(struct btrfs_trans_handle *trans,
+					   struct btrfs_root *root,
+					   struct extent_buffer *buf,
+					   struct extent_buffer *parent,
+					   int slot)
+{
+	u64 transid;
+
+	transid = btrfs_transid_for_header(trans, root, buf);
+
+	/*
+	 * If it does not need to cow this block, we still need to
+	 * update the block's generation, for transid may have been
+	 * changed during fsync.
+	*/
+	if (btrfs_header_generation(buf) == transid)
+		return;
+
+	btrfs_set_header_generation(buf, transid);
+
+	if (buf == root->node) {
+		btrfs_mark_buffer_dirty(buf);
+		add_root_to_dirty_list(root);
+	} else {
+		btrfs_set_node_ptr_generation(parent, slot, transid);
+		btrfs_mark_buffer_dirty(parent);
+		btrfs_mark_buffer_dirty(buf);
+	}
+}
+
 static inline int should_cow_block(struct btrfs_trans_handle *trans,
 				   struct btrfs_root *root,
 				   struct extent_buffer *buf)
 {
-	if (btrfs_header_generation(buf) == trans->transid &&
+	if (btrfs_header_generation(buf) >= trans->transaction->transid &&
 	    !btrfs_header_flag(buf, BTRFS_HEADER_FLAG_WRITTEN) &&
 	    !(root->root_key.objectid != BTRFS_TREE_RELOC_OBJECTID &&
 	      btrfs_header_flag(buf, BTRFS_HEADER_FLAG_RELOC)))
@@ -542,7 +599,7 @@ noinline int btrfs_cow_block(struct btrfs_trans_handle *trans,
 		       root->fs_info->running_transaction->transid);
 		WARN_ON(1);
 	}
-	if (trans->transid != root->fs_info->generation) {
+	if (trans->transaction->transid != root->fs_info->generation) {
 		printk(KERN_CRIT "trans %llu running %llu\n",
 		       (unsigned long long)trans->transid,
 		       (unsigned long long)root->fs_info->generation);
@@ -550,6 +607,7 @@ noinline int btrfs_cow_block(struct btrfs_trans_handle *trans,
 	}
 
 	if (!should_cow_block(trans, root, buf)) {
+		update_block_generation(trans, root, buf, parent, parent_slot);
 		*cow_ret = buf;
 		return 0;
 	}
@@ -645,7 +703,7 @@ int btrfs_realloc_node(struct btrfs_trans_handle *trans,
 
 	if (trans->transaction != root->fs_info->running_transaction)
 		WARN_ON(1);
-	if (trans->transid != root->fs_info->generation)
+	if (trans->transaction->transid != root->fs_info->generation)
 		WARN_ON(1);
 
 	parent_nritems = btrfs_header_nritems(parent);
@@ -898,7 +956,7 @@ static noinline int balance_level(struct btrfs_trans_handle *trans,
 
 	WARN_ON(path->locks[level] != BTRFS_WRITE_LOCK &&
 		path->locks[level] != BTRFS_WRITE_LOCK_BLOCKING);
-	WARN_ON(btrfs_header_generation(mid) != trans->transid);
+	WARN_ON(btrfs_header_generation(mid) < trans->transaction->transid);
 
 	orig_ptr = btrfs_node_blockptr(mid, orig_slot);
 
@@ -1106,7 +1164,7 @@ static noinline int push_nodes_for_insert(struct btrfs_trans_handle *trans,
 		return 1;
 
 	mid = path->nodes[level];
-	WARN_ON(btrfs_header_generation(mid) != trans->transid);
+	WARN_ON(btrfs_header_generation(mid) < trans->transaction->transid);
 
 	if (level < BTRFS_MAX_LEVEL - 1) {
 		parent = path->nodes[level + 1];
@@ -1699,15 +1757,10 @@ again:
 		 * contention with the cow code
 		 */
 		if (cow) {
-			/*
-			 * if we don't really need to cow this block
-			 * then we don't want to set the path blocking,
-			 * so we test it here
-			 */
-			if (!should_cow_block(trans, root, b))
+			if (!must_update_generation(trans, root, b) &&
+			    !should_cow_block(trans, root, b)) {
 				goto cow_done;
-
-			btrfs_set_path_blocking(p);
+			}
 
 			/*
 			 * must have write locks on this node and the
@@ -1718,6 +1771,20 @@ again:
 				btrfs_release_path(p);
 				goto again;
 			}
+
+			/*
+			 * if we don't really need to cow this block
+			 * then we don't want to set the path blocking,
+			 * so we test it here
+			 */
+			if (!should_cow_block(trans, root, b)) {
+				update_block_generation(trans, root, b,
+							p->nodes[level + 1],
+							p->slots[level + 1]);
+				goto cow_done;
+			}
+
+			btrfs_set_path_blocking(p);
 
 			err = btrfs_cow_block(trans, root, b,
 					      p->nodes[level + 1],
@@ -1944,8 +2011,8 @@ static int push_node_left(struct btrfs_trans_handle *trans,
 	src_nritems = btrfs_header_nritems(src);
 	dst_nritems = btrfs_header_nritems(dst);
 	push_items = BTRFS_NODEPTRS_PER_BLOCK(root) - dst_nritems;
-	WARN_ON(btrfs_header_generation(src) != trans->transid);
-	WARN_ON(btrfs_header_generation(dst) != trans->transid);
+	WARN_ON(btrfs_header_generation(src) < trans->transaction->transid);
+	WARN_ON(btrfs_header_generation(dst) < trans->transaction->transid);
 
 	if (!empty && src_nritems <= 8)
 		return 1;
@@ -2007,8 +2074,8 @@ static int balance_node_right(struct btrfs_trans_handle *trans,
 	int dst_nritems;
 	int ret = 0;
 
-	WARN_ON(btrfs_header_generation(src) != trans->transid);
-	WARN_ON(btrfs_header_generation(dst) != trans->transid);
+	WARN_ON(btrfs_header_generation(src) < trans->transaction->transid);
+	WARN_ON(btrfs_header_generation(dst) < trans->transaction->transid);
 
 	src_nritems = btrfs_header_nritems(src);
 	dst_nritems = btrfs_header_nritems(dst);
@@ -2084,7 +2151,22 @@ static noinline int insert_new_root(struct btrfs_trans_handle *trans,
 	btrfs_set_header_nritems(c, 1);
 	btrfs_set_header_level(c, level);
 	btrfs_set_header_bytenr(c, c->start);
-	btrfs_set_header_generation(c, trans->transid);
+
+	if (root->root_key.objectid == BTRFS_TREE_LOG_OBJECTID) {
+		btrfs_set_header_generation(c, trans->transaction->transid);
+
+		/* the root we're replacing needs to be given a sub_transid
+		 * generation, otherwise we might skip over it looking for
+		 * new items
+		 */
+		btrfs_set_header_generation(lower,
+					    trans->transaction->sub_transid);
+		btrfs_mark_buffer_dirty(lower);
+	} else {
+		btrfs_set_header_generation(c,
+					    trans->transaction->sub_transid);
+	}
+
 	btrfs_set_header_backref_rev(c, BTRFS_MIXED_BACKREF_REV);
 	btrfs_set_header_owner(c, root->root_key.objectid);
 
@@ -2099,7 +2181,7 @@ static noinline int insert_new_root(struct btrfs_trans_handle *trans,
 	btrfs_set_node_key(c, &lower_key, 0);
 	btrfs_set_node_blockptr(c, 0, lower->start);
 	lower_gen = btrfs_header_generation(lower);
-	WARN_ON(lower_gen != trans->transid);
+	WARN_ON(lower_gen < trans->transaction->transid);
 
 	btrfs_set_node_ptr_generation(c, 0, lower_gen);
 
@@ -2130,7 +2212,7 @@ static noinline int insert_new_root(struct btrfs_trans_handle *trans,
  */
 static int insert_ptr(struct btrfs_trans_handle *trans, struct btrfs_root
 		      *root, struct btrfs_path *path, struct btrfs_disk_key
-		      *key, u64 bytenr, int slot, int level)
+		      *key, u64 bytenr, int slot, int level, u64 gen)
 {
 	struct extent_buffer *lower;
 	int nritems;
@@ -2151,7 +2233,7 @@ static int insert_ptr(struct btrfs_trans_handle *trans, struct btrfs_root
 	btrfs_set_node_key(lower, key, slot);
 	btrfs_set_node_blockptr(lower, slot, bytenr);
 	WARN_ON(trans->transid == 0);
-	btrfs_set_node_ptr_generation(lower, slot, trans->transid);
+	btrfs_set_node_ptr_generation(lower, slot, gen);
 	btrfs_set_header_nritems(lower, nritems + 1);
 	btrfs_mark_buffer_dirty(lower);
 	return 0;
@@ -2179,7 +2261,7 @@ static noinline int split_node(struct btrfs_trans_handle *trans,
 	u32 c_nritems;
 
 	c = path->nodes[level];
-	WARN_ON(btrfs_header_generation(c) != trans->transid);
+	WARN_ON(btrfs_header_generation(c) < trans->transaction->transid);
 	if (c == root->node) {
 		/* trying to split the root, lets make a new one */
 		ret = insert_new_root(trans, root, path, level + 1);
@@ -2210,7 +2292,7 @@ static noinline int split_node(struct btrfs_trans_handle *trans,
 	memset_extent_buffer(split, 0, 0, sizeof(struct btrfs_header));
 	btrfs_set_header_level(split, btrfs_header_level(c));
 	btrfs_set_header_bytenr(split, split->start);
-	btrfs_set_header_generation(split, trans->transid);
+	btrfs_set_header_generation(split, trans->transaction->sub_transid);
 	btrfs_set_header_backref_rev(split, BTRFS_MIXED_BACKREF_REV);
 	btrfs_set_header_owner(split, root->root_key.objectid);
 	write_extent_buffer(split, root->fs_info->fsid,
@@ -2234,7 +2316,7 @@ static noinline int split_node(struct btrfs_trans_handle *trans,
 
 	wret = insert_ptr(trans, root, path, &disk_key, split->start,
 			  path->slots[level + 1] + 1,
-			  level + 1);
+			  level + 1, btrfs_header_generation(split));
 	if (wret)
 		ret = wret;
 
@@ -2768,7 +2850,8 @@ static noinline int copy_for_split(struct btrfs_trans_handle *trans,
 	ret = 0;
 	btrfs_item_key(right, &disk_key, 0);
 	wret = insert_ptr(trans, root, path, &disk_key, right->start,
-			  path->slots[1] + 1, 1);
+			  path->slots[1] + 1, 1,
+			  btrfs_header_generation(right));
 	if (wret)
 		ret = wret;
 
@@ -2963,7 +3046,7 @@ again:
 
 	memset_extent_buffer(right, 0, 0, sizeof(struct btrfs_header));
 	btrfs_set_header_bytenr(right, right->start);
-	btrfs_set_header_generation(right, trans->transid);
+	btrfs_set_header_generation(right, trans->transaction->sub_transid);
 	btrfs_set_header_backref_rev(right, BTRFS_MIXED_BACKREF_REV);
 	btrfs_set_header_owner(right, root->root_key.objectid);
 	btrfs_set_header_level(right, 0);
@@ -2980,7 +3063,8 @@ again:
 			btrfs_set_header_nritems(right, 0);
 			wret = insert_ptr(trans, root, path,
 					  &disk_key, right->start,
-					  path->slots[1] + 1, 1);
+					  path->slots[1] + 1, 1,
+					  btrfs_header_generation(right));
 			if (wret)
 				ret = wret;
 
@@ -2994,7 +3078,8 @@ again:
 			wret = insert_ptr(trans, root, path,
 					  &disk_key,
 					  right->start,
-					  path->slots[1], 1);
+					  path->slots[1], 1,
+					  btrfs_header_generation(right));
 			if (wret)
 				ret = wret;
 			btrfs_tree_unlock(path->nodes[0]);
@@ -3753,7 +3838,7 @@ static noinline int btrfs_del_leaf(struct btrfs_trans_handle *trans,
 {
 	int ret;
 
-	WARN_ON(btrfs_header_generation(leaf) != trans->transid);
+	WARN_ON(btrfs_header_generation(leaf) < trans->transaction->transid);
 	ret = del_ptr(trans, root, path, 1, path->slots[1]);
 	if (ret)
 		return ret;
@@ -3963,7 +4048,12 @@ again:
 	path->nodes[level] = cur;
 	path->locks[level] = BTRFS_READ_LOCK;
 
-	if (btrfs_header_generation(cur) < min_trans) {
+	/*
+	 * always check the root in the tree log, its transid is forced
+	 * to not use subtransids
+	 */
+	if (root->root_key.objectid != BTRFS_TREE_LOG_OBJECTID &&
+	    btrfs_header_generation(cur) < min_trans) {
 		ret = 1;
 		goto out;
 	}

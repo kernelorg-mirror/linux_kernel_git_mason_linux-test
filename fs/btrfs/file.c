@@ -548,7 +548,8 @@ int btrfs_drop_extent_cache(struct inode *inode, u64 start, u64 end,
  * is deleted from the tree.
  */
 int btrfs_drop_extents(struct btrfs_trans_handle *trans, struct inode *inode,
-		       u64 start, u64 end, u64 *hint_byte, int drop_cache)
+		       u64 start, u64 end, u64 *hint_byte, int drop_cache,
+		       int log)
 {
 	struct btrfs_root *root = BTRFS_I(inode)->root;
 	struct extent_buffer *leaf;
@@ -567,6 +568,10 @@ int btrfs_drop_extents(struct btrfs_trans_handle *trans, struct inode *inode,
 	int extent_type;
 	int recow;
 	int ret;
+
+	/* drop the existed extents in log tree */
+	if (log)
+		root = root->log_root;
 
 	if (drop_cache)
 		btrfs_drop_extent_cache(inode, start, end - 1, 0);
@@ -673,7 +678,7 @@ next_slot:
 							extent_end - start);
 			btrfs_mark_buffer_dirty(leaf);
 
-			if (disk_bytenr > 0) {
+			if (disk_bytenr > 0 && !log) {
 				ret = btrfs_inc_extent_ref(trans, root,
 						disk_bytenr, num_bytes, 0,
 						root->root_key.objectid,
@@ -748,7 +753,7 @@ next_slot:
 						extent_end - key.offset);
 				extent_end = ALIGN(extent_end,
 						   root->sectorsize);
-			} else if (disk_bytenr > 0) {
+			} else if (disk_bytenr > 0 && !log) {
 				ret = btrfs_free_extent(trans, root,
 						disk_bytenr, num_bytes, 0,
 						root->root_key.objectid,
@@ -1414,19 +1419,6 @@ static ssize_t btrfs_file_aio_write(struct kiocb *iocb,
 
 	mutex_unlock(&inode->i_mutex);
 
-	/*
-	 * we want to make sure fsync finds this change
-	 * but we haven't joined a transaction running right now.
-	 *
-	 * Later on, someone is sure to update the inode and get the
-	 * real transid recorded.
-	 *
-	 * We set last_trans now to the fs_info generation + 1,
-	 * this will either be one more than the running transaction
-	 * or the generation used for the next transaction if there isn't
-	 * one running right now.
-	 */
-	BTRFS_I(inode)->last_trans = root->fs_info->generation + 1;
 	if (num_written > 0 || num_written == -EIOCBQUEUED) {
 		err = generic_write_sync(file, pos, num_written);
 		if (err < 0 && num_written > 0)

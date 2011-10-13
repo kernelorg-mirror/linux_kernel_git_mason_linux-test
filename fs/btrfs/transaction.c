@@ -113,7 +113,9 @@ static noinline int join_transaction(struct btrfs_root *root, int nofail)
 	extent_io_tree_init(&cur_trans->dirty_pages,
 			     root->fs_info->btree_inode->i_mapping);
 	root->fs_info->generation++;
+	root->fs_info->sub_generation = root->fs_info->generation;
 	cur_trans->transid = root->fs_info->generation;
+	cur_trans->sub_transid = cur_trans->transid;
 	root->fs_info->running_transaction = cur_trans;
 	spin_unlock(&root->fs_info->trans_lock);
 
@@ -129,7 +131,7 @@ static noinline int join_transaction(struct btrfs_root *root, int nofail)
 static int record_root_in_trans(struct btrfs_trans_handle *trans,
 			       struct btrfs_root *root)
 {
-	if (root->ref_cows && root->last_trans < trans->transid) {
+	if (root->ref_cows && root->last_trans < trans->transaction->transid) {
 		WARN_ON(root == root->fs_info->extent_root);
 		WARN_ON(root->commit_root != root->node);
 
@@ -146,7 +148,7 @@ static int record_root_in_trans(struct btrfs_trans_handle *trans,
 		smp_wmb();
 
 		spin_lock(&root->fs_info->fs_roots_radix_lock);
-		if (root->last_trans == trans->transid) {
+		if (root->last_trans >= trans->transaction->transid) {
 			spin_unlock(&root->fs_info->fs_roots_radix_lock);
 			return 0;
 		}
@@ -194,7 +196,7 @@ int btrfs_record_root_in_trans(struct btrfs_trans_handle *trans,
 	 * and barriers
 	 */
 	smp_rmb();
-	if (root->last_trans == trans->transid &&
+	if (root->last_trans >= trans->transaction->transid &&
 	    !root->in_trans_setup)
 		return 0;
 
@@ -302,7 +304,7 @@ again:
 
 	cur_trans = root->fs_info->running_transaction;
 
-	h->transid = cur_trans->transid;
+	h->transid = cur_trans->sub_transid;
 	h->transaction = cur_trans;
 	h->blocks_used = 0;
 	h->bytes_reserved = 0;
@@ -1310,6 +1312,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans,
 
 	trans->transaction->blocked = 0;
 	spin_lock(&root->fs_info->trans_lock);
+	root->fs_info->generation = cur_trans->sub_transid;
 	root->fs_info->running_transaction = NULL;
 	root->fs_info->trans_no_join = 0;
 	spin_unlock(&root->fs_info->trans_lock);
@@ -1331,7 +1334,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans,
 
 	cur_trans->commit_done = 1;
 
-	root->fs_info->last_trans_committed = cur_trans->transid;
+	root->fs_info->last_trans_committed = cur_trans->sub_transid;
 
 	wake_up(&cur_trans->commit_wait);
 
