@@ -1795,6 +1795,8 @@ static int btrfs_finish_ordered_io(struct inode *inode, u64 start, u64 end)
 	if (!ret || !test_bit(BTRFS_ORDERED_PREALLOC, &ordered_extent->flags)) {
 		ret = btrfs_update_inode(trans, root, inode);
 		BUG_ON(ret);
+	} else {
+		btrfs_set_inode_last_trans(trans, inode);
 	}
 	ret = 0;
 out:
