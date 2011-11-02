@@ -2769,12 +2769,9 @@ static noinline int copy_items(struct btrfs_trans_handle *trans,
 	char *ins_data;
 	int i;
 	struct list_head ordered_sums;
+	int ran_eexist = 0;
 
 	INIT_LIST_HEAD(&ordered_sums);
-
-	ret = prepare_for_merge_items(trans, inode, src, start_slot, nr);
-	if (ret)
-		return ret;
 
 	ins_data = kmalloc(nr * sizeof(struct btrfs_key) +
 			   nr * sizeof(u32), GFP_NOFS);
@@ -2787,9 +2784,30 @@ static noinline int copy_items(struct btrfs_trans_handle *trans,
 		ins_sizes[i] = btrfs_item_size_nr(src, i + start_slot);
 		btrfs_item_key_to_cpu(src, ins_keys + i, i + start_slot);
 	}
+
+again:
+	ret = prepare_for_merge_items(trans, inode, src, start_slot, nr);
+	if (ret) {
+		kfree(ins_data);
+		return ret;
+	}
+
 	ret = btrfs_insert_empty_items(trans, log, dst_path,
 				       ins_keys, ins_sizes, nr);
 	if (ret) {
+		/*
+		 * the inode logging code means we might free and inode
+		 * and reallocate it, so it might have items in the log.
+		 * Since we're relogging it again, just clear them out
+		 */
+		if (ins_keys[0].type == BTRFS_INODE_ITEM_KEY &&
+		    ret == -EEXIST && !ran_eexist) {
+			ran_eexist = 1;
+			btrfs_release_path(dst_path);
+			ret = btrfs_truncate_inode_items(trans, log, inode, 0, 0);
+			BTRFS_I(inode)->logged_trans = trans->transaction->transid;
+			goto again;
+		}
 		kfree(ins_data);
 		return ret;
 	}
