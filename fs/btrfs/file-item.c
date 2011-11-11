@@ -167,6 +167,9 @@ static int __btrfs_lookup_bio_sums(struct btrfs_root *root,
 	struct btrfs_csum_item *item = NULL;
 	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
 
+	if (!root->fs_info->csum_root->node)
+		return -EIO;
+
 	path = btrfs_alloc_path();
 	if (!path)
 		return -ENOMEM;
@@ -550,6 +553,8 @@ int btrfs_del_csums(struct btrfs_trans_handle *trans,
 	int blocksize_bits = root->fs_info->sb->s_blocksize_bits;
 
 	root = root->fs_info->csum_root;
+	if (!root->node)
+		return -EIO;
 
 	path = btrfs_alloc_path();
 	if (!path)

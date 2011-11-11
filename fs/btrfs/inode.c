@@ -1479,6 +1479,10 @@ static int btrfs_submit_bio_hook(struct inode *inode, int rw, struct bio *bio,
 	int ret = 0;
 	int skip_sum;
 
+	/*
+	 * even if we're mounted nodatasum, once the inode has sums we have
+	 * to keep summing it for writes.
+	 */
 	skip_sum = BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM;
 
 	if (btrfs_is_free_space_inode(root, inode))
@@ -1488,10 +1492,11 @@ static int btrfs_submit_bio_hook(struct inode *inode, int rw, struct bio *bio,
 	BUG_ON(ret);
 
 	if (!(rw & REQ_WRITE)) {
+		/* for reads, we can skip the crc if we're mounted NODATASUM */
 		if (bio_flags & EXTENT_BIO_COMPRESSED) {
 			return btrfs_submit_compressed_read(inode, bio,
 						    mirror_num, bio_flags);
-		} else if (!skip_sum) {
+		} else if (!skip_sum && !btrfs_test_opt(root, NODATASUM)) {
 			ret = btrfs_lookup_bio_sums(root, inode, bio, NULL);
 			if (ret)
 				return ret;
@@ -1847,6 +1852,9 @@ static int btrfs_readpage_end_io_hook(struct page *page, u64 start, u64 end,
 	}
 
 	if (BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM)
+		goto good;
+
+	if (btrfs_test_opt(root, NODATASUM))
 		goto good;
 
 	if (root->root_key.objectid == BTRFS_DATA_RELOC_TREE_OBJECTID &&
@@ -5580,10 +5588,15 @@ static void btrfs_endio_direct_read(struct bio *bio, int err)
 	struct btrfs_root *root = BTRFS_I(inode)->root;
 	u64 start;
 	u32 *private = dip->csums;
+	int check_sums = 1;
+
+	if ((BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM) ||
+	    btrfs_test_opt(root, NODATASUM))
+		check_sums = 0;
 
 	start = dip->logical_offset;
 	do {
-		if (!(BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM)) {
+		if (check_sums) {
 			struct page *page = bvec->bv_page;
 			char *kaddr;
 			u32 csum = ~(u32)0;
@@ -5949,6 +5962,8 @@ static void btrfs_submit_direct(int rw, struct bio *bio, struct inode *inode,
 	int ret = 0;
 
 	skip_sum = BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM;
+	if (!write)
+		skip_sum |= btrfs_test_opt(root, NODATASUM);
 
 	dip = kmalloc(sizeof(*dip), GFP_NOFS);
 	if (!dip) {

@@ -1773,11 +1773,14 @@ static void backup_super_roots(struct btrfs_fs_info *info)
 	btrfs_set_backup_dev_root_level(root_backup,
 				       btrfs_header_level(info->dev_root->node));
 
-	btrfs_set_backup_csum_root(root_backup, info->csum_root->node->start);
-	btrfs_set_backup_csum_root_gen(root_backup,
+	if (info->csum_root->node) {
+		btrfs_set_backup_csum_root(root_backup,
+					   info->csum_root->node->start);
+		btrfs_set_backup_csum_root_gen(root_backup,
 			       btrfs_header_generation(info->csum_root->node));
-	btrfs_set_backup_csum_root_level(root_backup,
+		btrfs_set_backup_csum_root_level(root_backup,
 			       btrfs_header_level(info->csum_root->node));
+	}
 
 	btrfs_set_backup_total_bytes(root_backup,
 			     btrfs_super_total_bytes(info->super_copy));
@@ -2306,8 +2309,25 @@ retry_root_backup:
 
 	ret = find_and_setup_root(tree_root, fs_info,
 				  BTRFS_CSUM_TREE_OBJECTID, csum_root);
-	if (ret)
-		goto recovery_tree_root;
+	if (ret) {
+		if (!btrfs_test_opt(tree_root, RECOVERY_ERR))
+			goto recovery_tree_root;
+
+		/* don't use the log in recovery mode, it won't be valid */
+		btrfs_set_super_log_root(disk_super, 0);
+
+		/* we can't trust the free space cache either */
+		btrfs_set_opt(fs_info->mount_opt, CLEAR_CACHE);
+
+		/* we must set ourselves readonly */
+		sb->s_flags |= MS_RDONLY;
+
+		/* the crc tree is dead, don't use it */
+		btrfs_set_opt(fs_info->mount_opt, NODATASUM);
+
+		printk("btrfs failed to read the csum root, forcing readonly\n");
+		ret = 0;
+	}
 
 	csum_root->track_dirty = 1;
 
